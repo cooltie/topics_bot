@@ -82,7 +82,7 @@ async def get_db_pool2():
 
 # Инициализация бота и диспетчера
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(bot)
+dp = Dispatcher()
 
 
 # Регистрация пользователя с созданием нового топика
