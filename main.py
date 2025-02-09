@@ -1,22 +1,54 @@
 import asyncio
 from asyncio import Lock
 import asyncpg
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
-from dotenv import load_dotenv
-import uuid
 import os
+import uuid
 import logging
+from aiogram import Bot, Dispatcher, F, types
+from aiogram.filters import Command
+from dotenv import load_dotenv
 
 logging.basicConfig(level=logging.DEBUG)
 
 # Загрузка данных из .env
 load_dotenv()
-
 db_lock = Lock()
-
 db_pool2 = None
+retry_queue = []
+
+async def process_retry_queue():
+    global retry_queue
+    while True:
+        # Копируем очередь для итерирования
+        for item in retry_queue.copy():
+            send_method = item.get('send_method')
+            kwargs = item.get('kwargs')
+            try:
+                await send_method(**kwargs)
+                retry_queue.remove(item)
+                logging.info("Сообщение успешно отправлено из очереди.")
+            except Exception as e:
+                logging.error(f"Не удалось отправить сообщение из очереди: {e}")
+        await asyncio.sleep(10)
+
+async def safe_send(send_method, **kwargs):
+    try:
+        return await send_method(**kwargs)
+    except Exception as e:
+        logging.error(f"Ошибка отправки, сообщение сохранено для повторной отправки: {e}")
+        retry_queue.append({
+            'send_method': send_method,
+            'kwargs': kwargs,
+        })
+        # Пытаемся уведомить пользователя о проблемах, если указан chat_id
+        if 'chat_id' in kwargs:
+            try:
+                await bot.send_message(chat_id=kwargs['chat_id'],
+                                       text="Сейчас возникли проблемы с сетью. "
+                                            "Ваше сообщение будет отправлено, как только связь восстановится.")
+            except Exception as inner:
+                logging.error(f"Не удалось отправить уведомление пользователю: {inner}")
+        return None
 
 
 # Асинхронная функция для логирования состояния пула
@@ -50,10 +82,11 @@ async def get_db_pool2():
 
 # Инициализация бота и диспетчера
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+dp = Dispatcher(bot)
+
 
 # Регистрация пользователя с созданием нового топика
-async def register_user(telegram_id):
+async def register_user(telegram_id: str):
     """
     Регистрирует пользователя, создавая анонимный ID и топик для взаимодействия.
     """
@@ -121,7 +154,6 @@ async def start_command(message: types.Message):
 
         if result:
             user_number = result["id"]
-            topic_name = f"{user_number}"
 
         await message.answer(
             "Привет 👋! Это бот по физике ✨\n Если...",
@@ -145,60 +177,66 @@ async def handle_user_message(message: types.Message):
     anon_id, topic_id = await register_user(message.from_user.id)
 
     try:
-        # Формируем идентификатор для анонимности
+
+         # Формируем идентификатор для анонимности
         user_tag = f"Сообщение от {str(anon_id)[:4]}:"
 
         # Отправляем разные типы сообщений
         if message.text:
-            forward_message = f"{user_tag}\n{message.text}"
-            await bot.send_message(
-                chat_id=GROUP_ID, message_thread_id=topic_id, text=forward_message
+            forward_message = f"{message.text}"
+            await safe_send(
+                bot.send_message,
+                chat_id=GROUP_ID,
+                message_thread_id=topic_id,
+                text=forward_message
             )
         elif message.photo:
-            await bot.send_photo(
+            await safe_send(
+                bot.send_photo,
                 chat_id=GROUP_ID,
                 message_thread_id=topic_id,
                 photo=message.photo[-1].file_id,
                 caption=f"{user_tag}\n{message.caption or ''}",
             )
         elif message.video:
-            await bot.send_video(
+            await safe_send(
+                bot.send_video,
                 chat_id=GROUP_ID,
                 message_thread_id=topic_id,
                 video=message.video.file_id,
                 caption=f"{user_tag}\n{message.caption or ''}",
             )
         elif message.document:
-            await bot.send_document(
+            await safe_send(
+                bot.send_document,
                 chat_id=GROUP_ID,
                 message_thread_id=topic_id,
                 document=message.document.file_id,
                 caption=f"{user_tag}\n{message.caption or ''}",
             )
         elif message.audio:
-            await bot.send_audio(
+            await safe_send(
+                bot.send_audio,
                 chat_id=GROUP_ID,
                 message_thread_id=topic_id,
                 audio=message.audio.file_id,
                 caption=f"{user_tag}\n{message.caption or ''}",
             )
         elif message.voice:
-            await bot.send_voice(
+            await safe_send(
+                bot.send_voice,
                 chat_id=GROUP_ID,
                 message_thread_id=topic_id,
                 voice=message.voice.file_id,
                 caption=user_tag,
             )
         else:
-            await bot.send_message(
+            await safe_send(
+                bot.send_message,
                 chat_id=GROUP_ID,
                 message_thread_id=topic_id,
                 text=f"{user_tag}\nТип сообщения пока не поддерживается.",
             )
-
-        # Уведомляем пользователя
-        await message.answer("Сообщение отправлено!")
-        logging.info(f"Сообщение от {message.from_user.id} успешно переслано в топик.")
 
     except Exception as e:
         logging.error(f"Ошибка при обработке сообщения от пользователя: {e}")
@@ -273,38 +311,45 @@ async def process_admin_message(message: types.Message):
 
         # Пересылаем сообщение пользователю в зависимости от типа контента
         if message.photo:
-            await bot.send_photo(
+            await safe_send(
+                bot.send_photo,
                 chat_id=telegram_id,
                 photo=message.photo[-1].file_id,
                 caption=message.caption,
             )
         elif message.video:
-            await bot.send_video(
+            await safe_send(
+                bot.send_video,
                 chat_id=telegram_id,
                 video=message.video.file_id,
                 caption=message.caption,
             )
         elif message.document:
-            await bot.send_document(
+            await safe_send(
+                bot.send_document,
                 chat_id=telegram_id,
                 document=message.document.file_id,
                 caption=message.caption,
             )
         elif message.audio:
-            await bot.send_audio(
+            await safe_send(
+                bot.send_audio,
                 chat_id=telegram_id,
                 audio=message.audio.file_id,
                 caption=message.caption,
             )
         elif message.voice:
-            await bot.send_voice(
+            await safe_send(
+                bot.send_voice,
                 chat_id=telegram_id,
                 voice=message.voice.file_id,
                 caption=message.caption,
             )
         elif message.text:
-            await bot.send_message(
-                chat_id=telegram_id, text=f"\n\n{message.text}"
+            await safe_send(
+                bot.send_message,
+                chat_id=telegram_id,
+                text=f"\n\n{message.text}"
             )
 
         logging.info(f"Ответ успешно отправлен пользователю с ID {telegram_id}")
@@ -327,6 +372,10 @@ async def main():
             logging.info("Подключение к базе данных успешно установлено")
 
         await log_pool_state()  # Логирование состояния пула
+
+        # Запускаем фоновую задачу для повторной отправки сообщений
+        asyncio.create_task(process_retry_queue())
+
         await dp.start_polling(bot)
     except Exception as e:
         logging.error(f"Ошибка при подключении к базе данных: {e}")
